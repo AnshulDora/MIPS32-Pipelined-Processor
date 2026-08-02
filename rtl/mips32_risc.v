@@ -1,23 +1,4 @@
 `timescale 1ns / 1ps
-//////////////////////////////////////////////////////////////////////////////////
-// Company: 
-// Engineer: 
-// 
-// Create Date: 02.07.2026 09:31:18
-// Design Name: 
-// Module Name: mips32_risc
-// Project Name: 
-// Target Devices: 
-// Tool Versions: 
-// Description: Fully synthesizable MIPS32 pipeline with explicit hardware reset.
-// 
-// Dependencies: 
-// 
-// Revision:
-// Revision 0.03 - Removed initial block, implemented synthesizable hardware reset (rst)
-// Additional Comments:
-// 
-//////////////////////////////////////////////////////////////////////////////////
 
 module mips32_risc(
     input clk1, clk2,
@@ -47,15 +28,17 @@ parameter SLT    = 6'b101010;
 reg [31:0] pc;
 reg [31:0] if_id_ir, if_id_npc;
 reg [31:0] id_ex_ir, id_ex_a, id_ex_b, id_ex_imm, id_ex_npc;
-reg [31:0] ex_mem_ir, ex_mem_aluout, ex_mem_b;
-reg ex_mem_cond;
-reg taken_branch;
+reg [31:0] ex_mem_ir, ex_mem_aluout, ex_mem_b, alu_in_a, alu_in_b;
+reg [4:0]  ex_mem_dest;
+reg        ex_mem_cond;
+reg        taken_branch;
 reg [31:0] mem_wb_ir, mem_wb_lmd, mem_wb_aluout;
+reg [4:0]  mem_wb_dest;
 reg [31:0] wb_end_ir;
 
 reg [31:0] instruct_mem [0:1023];
-reg [31:0] data_mem [0:1023];     
-reg [31:0] reg_bank [0:31];
+reg [31:0] data_mem     [0:1023];     
+reg [31:0] reg_bank     [0:31];
 
 // ==========================================
 // 1. INSTRUCTION FETCH (IF) STAGE - clk1
@@ -68,8 +51,7 @@ always @(posedge clk1) begin
       taken_branch <= 1'b0;
    end
    else if (halted) begin
-      // Freeze PC and continuously inject NOPs into the pipeline
-      if_id_ir  <= 32'd0; 
+      if_id_ir     <= 32'd0; // Freeze PC and continuously inject NOPs
    end
    else if ((ex_mem_ir[31:26] == BEQ) && (ex_mem_cond)) begin
       if_id_ir     <= 32'd0;
@@ -79,8 +61,8 @@ always @(posedge clk1) begin
    end
    else begin
       if_id_ir     <= instruct_mem[pc];
-      if_id_npc    <= pc + 1;
-      pc           <= pc + 1;
+      if_id_npc    <= pc + 32'd1;
+      pc           <= pc + 32'd1;
    end 
 end
 
@@ -101,21 +83,21 @@ always @(posedge clk2) begin
       id_ex_a   <= 32'd0;
       id_ex_b   <= 32'd0;
       id_ex_imm <= 32'd0;
-      id_ex_npc <= if_id_npc;
+      id_ex_npc <= 32'd0;
    end
    else if (if_id_ir[31:26] == HALT) begin
-      halted    <= 1'b1;   // Permanently latches the halt state
-      id_ex_ir  <= if_id_ir; // Passes HALT along to flush downstream stages safely
+      halted    <= 1'b1;     // Latches halt state
+      id_ex_ir  <= if_id_ir; // Passes HALT to flush downstream stages
       id_ex_a   <= 32'd0;
       id_ex_b   <= 32'd0;
       id_ex_imm <= 32'd0;
-      id_ex_npc <= if_id_npc;
+      id_ex_npc <= 32'd0;
    end
    else begin
       id_ex_ir  <= if_id_ir;
       id_ex_a   <= reg_bank[if_id_ir[25:21]];
       id_ex_b   <= reg_bank[if_id_ir[20:16]];
-      id_ex_imm <= {{16{if_id_ir[15]}}, {if_id_ir[15:0]}};
+      id_ex_imm <= {{16{if_id_ir[15]}}, if_id_ir[15:0]}; // Fixed syntax
       id_ex_npc <= if_id_npc;
    end
 end
@@ -123,41 +105,82 @@ end
 // ==========================================
 // 3. EXECUTE (EX) STAGE - clk1
 // ==========================================
+always @(*) begin
+    // --- Operand A Forwarding ---
+    if ((id_ex_ir[25:21] == ex_mem_dest) && (ex_mem_dest != 5'd0)) begin
+        alu_in_a = ex_mem_aluout; // Priority 1: Forward from EX/MEM
+    end 
+    else if ((id_ex_ir[25:21] == mem_wb_dest) && (mem_wb_dest != 5'd0)) begin
+        case (mem_wb_ir[31:26])
+            LW:      alu_in_a = mem_wb_lmd;    // Memory load result
+            R_TYPE,
+            ADDI:    alu_in_a = mem_wb_aluout; // ALU result
+            default: alu_in_a = id_ex_a;
+        endcase
+    end
+    else begin
+        alu_in_a = id_ex_a; // Default: Register file read
+    end
+
+    // --- Operand B Forwarding ---
+    if ((id_ex_ir[20:16] == ex_mem_dest) && (ex_mem_dest != 5'd0)) begin
+        alu_in_b = ex_mem_aluout; // Priority 1: Forward from EX/MEM
+    end 
+    else if ((id_ex_ir[20:16] == mem_wb_dest) && (mem_wb_dest != 5'd0)) begin
+        case (mem_wb_ir[31:26])
+            LW:      alu_in_b = mem_wb_lmd;
+            R_TYPE,
+            ADDI:    alu_in_b = mem_wb_aluout;
+            default: alu_in_b = id_ex_b;
+        endcase
+    end 
+    else begin
+        alu_in_b = id_ex_b; // Default: Register file read
+    end
+end
+
 always @(posedge clk1) begin 
    if (rst) begin
       ex_mem_ir     <= 32'd0;
       ex_mem_aluout <= 32'd0;
       ex_mem_b      <= 32'd0;
       ex_mem_cond   <= 1'b0;
+      ex_mem_dest   <= 5'd0;
    end
    else begin
-      taken_branch <= 1'b0; // Safely pull down flag
+      taken_branch <= 1'b0; // Pull down flag
       ex_mem_ir    <= id_ex_ir;
-      
-      if (id_ex_ir[31:26] == R_TYPE) begin // R-Type
-         ex_mem_b    <= id_ex_b;
+
+      case (id_ex_ir[31:26])
+         R_TYPE:  ex_mem_dest <= id_ex_ir[15:11]; // rd
+         ADDI,LW: ex_mem_dest <= id_ex_ir[20:16]; // rt
+         default: ex_mem_dest <= 5'd0;            // SW, BEQ, HALT write no register
+      endcase
+
+      if (id_ex_ir[31:26] == R_TYPE) begin
+         ex_mem_b    <= alu_in_b;
          ex_mem_cond <= 1'b0;            
          
          case (id_ex_ir[5:0])
-            ADD:     ex_mem_aluout <= id_ex_a + id_ex_b;     
-            SUB:     ex_mem_aluout <= id_ex_a - id_ex_b;     
-            AND:     ex_mem_aluout <= id_ex_a & id_ex_b;     
-            OR:      ex_mem_aluout <= id_ex_a | id_ex_b;     
-            SLT:     ex_mem_aluout <= (id_ex_a < id_ex_b);   
+            ADD:     ex_mem_aluout <= alu_in_a + alu_in_b;     
+            SUB:     ex_mem_aluout <= alu_in_a - alu_in_b;     
+            AND:     ex_mem_aluout <= alu_in_a & alu_in_b;     
+            OR:      ex_mem_aluout <= alu_in_a | alu_in_b;     
+            SLT:     ex_mem_aluout <= (alu_in_a < alu_in_b);   
             default: ex_mem_aluout <= 32'd0;
          endcase        
       end
-      else begin // I-Type
+      else begin
          case (id_ex_ir[31:26])
             ADDI, LW, SW: begin 
-               ex_mem_aluout <= id_ex_a + id_ex_imm; 
-               ex_mem_b      <= id_ex_b;
+               ex_mem_aluout <= alu_in_a + id_ex_imm; 
+               ex_mem_b      <= alu_in_b;
                ex_mem_cond   <= 1'b0;                
             end
             BEQ: begin 
                ex_mem_aluout <= id_ex_imm + id_ex_npc;
-               ex_mem_b      <= id_ex_b;
-               ex_mem_cond   <= (id_ex_a == id_ex_b); 
+               ex_mem_b      <= alu_in_b;
+               ex_mem_cond   <= (alu_in_a == alu_in_b); 
             end
             default: begin
                ex_mem_aluout <= 32'd0;
@@ -176,12 +199,14 @@ always @(posedge clk2) begin
       mem_wb_ir     <= 32'd0;
       mem_wb_aluout <= 32'd0;
       mem_wb_lmd    <= 32'd0;
+      mem_wb_dest   <= 5'd0;
    end
    else begin
-      mem_wb_ir      <= ex_mem_ir;
+      mem_wb_ir     <= ex_mem_ir;
       mem_wb_aluout <= ex_mem_aluout;
-      
-      case(ex_mem_ir[31:26])
+      mem_wb_dest   <= ex_mem_dest;
+
+      case (ex_mem_ir[31:26])
           LW: mem_wb_lmd <= data_mem[ex_mem_aluout];
           SW: begin 
                 data_mem[ex_mem_aluout] <= ex_mem_b; 
@@ -198,8 +223,6 @@ end
 always @(posedge clk1) begin
    if (rst) begin
       wb_end_ir <= 32'd0;
-      // Note: Reg_bank and data_mem typically do not reset via logic blocks 
-      // to avoid massive hardware overhead; they get overwritten during execution.
    end
    else begin
       wb_end_ir <= mem_wb_ir;
@@ -224,7 +247,7 @@ always @(posedge clk1) begin
           end
           
           default: begin
-             // SW, BEQ, HALT ignore writeback
+             // SW, BEQ, HALT write nothing
           end
       endcase
    end
